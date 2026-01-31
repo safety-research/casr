@@ -3,6 +3,8 @@
 //! Unlike casr-libfuzzer + casr-cluster pipeline, this tool preserves
 //! the mapping of ALL original crashes to their cluster IDs, even if
 //! they were deduplicated due to identical stacktraces.
+//!
+//! Supports both libFuzzer and AFL++ crash directories.
 
 use casr::util;
 use libcasr::cluster::Cluster;
@@ -179,6 +181,181 @@ fn group_by_stacktrace(
     groups
 }
 
+/// Fuzzer type for crash directory structure
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FuzzerType {
+    LibFuzzer,
+    Afl,
+}
+
+/// Detect fuzzer type from directory structure
+fn detect_fuzzer_type(input_dir: &Path) -> FuzzerType {
+    // Check for AFL++ structure: crashes subdirectory or node directories with crashes
+    if input_dir.join("crashes").is_dir() {
+        return FuzzerType::Afl;
+    }
+
+    // Check for AFL++ multi-node structure (directories containing "crashes" subdirs)
+    if let Ok(entries) = fs::read_dir(input_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("crashes").is_dir() {
+                return FuzzerType::Afl;
+            }
+        }
+    }
+
+    // Check for libFuzzer crash naming convention
+    if let Ok(entries) = fs::read_dir(input_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("crash-") || name.starts_with("leak-") {
+                return FuzzerType::LibFuzzer;
+            }
+            // AFL crash naming: id:000000,* or id-000000-*
+            if name.starts_with("id:") || name.starts_with("id-") {
+                return FuzzerType::Afl;
+            }
+        }
+    }
+
+    // Default to libFuzzer
+    FuzzerType::LibFuzzer
+}
+
+/// Collect crash files from libFuzzer directory
+fn collect_libfuzzer_crashes(input_dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(input_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            if !p.is_file() {
+                return false;
+            }
+            let name = p.file_name().unwrap().to_str().unwrap();
+            // Skip hidden files
+            if name.starts_with('.') {
+                return false;
+            }
+            // libFuzzer naming: crash-*, leak-*, or any file (for LibAFL)
+            name.starts_with("crash-") || name.starts_with("leak-") || !name.contains('.')
+        })
+        .collect()
+}
+
+/// Collect crash files from AFL++ directory structure
+fn collect_afl_crashes(input_dir: &Path) -> Vec<PathBuf> {
+    let mut crashes = Vec::new();
+
+    // Check if this is vanilla AFL (crashes dir directly in input)
+    let crashes_dir = input_dir.join("crashes");
+    if crashes_dir.is_dir() {
+        // Vanilla AFL structure
+        if let Ok(entries) = fs::read_dir(&crashes_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    if name.starts_with("id:") || name.starts_with("id-") || name.starts_with("id") {
+                        crashes.push(path);
+                    }
+                }
+            }
+        }
+        return crashes;
+    }
+
+    // AFL++ multi-node structure: <node>/crashes/*
+    if let Ok(node_entries) = fs::read_dir(input_dir) {
+        for node_entry in node_entries.flatten() {
+            let node_path = node_entry.path();
+            if !node_path.is_dir() {
+                continue;
+            }
+
+            // Look for crashes directory in each node
+            let node_crashes_dir = node_path.join("crashes");
+            if node_crashes_dir.is_dir() {
+                if let Ok(crash_entries) = fs::read_dir(&node_crashes_dir) {
+                    for crash_entry in crash_entries.flatten() {
+                        let crash_path = crash_entry.path();
+                        if crash_path.is_file() {
+                            let name = crash_path.file_name().unwrap().to_string_lossy();
+                            if name.starts_with("id:") || name.starts_with("id-") || name.starts_with("id") {
+                                crashes.push(crash_path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also check for crashes* directories (AFL++ can have crashes0, crashes1, etc.)
+            if let Ok(subdir_entries) = fs::read_dir(&node_path) {
+                for subdir_entry in subdir_entries.flatten() {
+                    let subdir_name = subdir_entry.file_name().to_string_lossy().to_string();
+                    if subdir_name.starts_with("crashes") && subdir_entry.path().is_dir() {
+                        if let Ok(crash_entries) = fs::read_dir(subdir_entry.path()) {
+                            for crash_entry in crash_entries.flatten() {
+                                let crash_path = crash_entry.path();
+                                if crash_path.is_file() {
+                                    let name = crash_path.file_name().unwrap().to_string_lossy();
+                                    if name.starts_with("id:") || name.starts_with("id-") || name.starts_with("id") {
+                                        crashes.push(crash_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    crashes
+}
+
+/// Try to read command line from AFL++ cmdline file
+fn read_afl_cmdline(input_dir: &Path) -> Option<Vec<String>> {
+    // Check vanilla AFL
+    let cmdline_path = input_dir.join("cmdline");
+    if cmdline_path.exists() {
+        if let Ok(content) = fs::read_to_string(&cmdline_path) {
+            let args: Vec<String> = content
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
+            if !args.is_empty() {
+                return Some(args);
+            }
+        }
+    }
+
+    // Check AFL++ multi-node (first node with cmdline)
+    if let Ok(entries) = fs::read_dir(input_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let node_cmdline = path.join("cmdline");
+                if node_cmdline.exists() {
+                    if let Ok(content) = fs::read_to_string(&node_cmdline) {
+                        let args: Vec<String> = content
+                            .split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect();
+                        if !args.is_empty() {
+                            return Some(args);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn main() -> Result<()> {
     let matches = clap::Command::new("casr-cluster-map")
         .version(clap::crate_version!())
@@ -237,8 +414,17 @@ fn main() -> Result<()> {
                 .long("tool")
                 .action(ArgAction::Set)
                 .value_name("TOOL")
-                .value_parser(["casr-san", "casr-gdb", "casr-python", "casr-java", "casr-js", "casr-lua"])
+                .value_parser(["casr-san", "casr-gdb", "casr-python", "casr-java", "casr-js", "casr-lua", "casr-csharp"])
                 .help("Force specific CASR tool (auto-detect if not specified)"),
+        )
+        .arg(
+            Arg::new("fuzzer")
+                .long("fuzzer")
+                .action(ArgAction::Set)
+                .value_name("FUZZER")
+                .value_parser(["auto", "libfuzzer", "afl"])
+                .default_value("auto")
+                .help("Fuzzer type: 'libfuzzer' for libFuzzer/LibAFL, 'afl' for AFL++, 'auto' to detect"),
         )
         .arg(
             Arg::new("ignore")
@@ -253,8 +439,9 @@ fn main() -> Result<()> {
                 .action(ArgAction::Set)
                 .num_args(1..)
                 .last(true)
-                .required(true)
-                .help("Target binary and arguments. Use @@ as placeholder for crash input."),
+                .required(false)
+                .help("Target binary and arguments. Use @@ as placeholder for crash input. \
+                       For AFL++, can be omitted to read from cmdline file."),
         )
         .get_matches();
 
@@ -276,11 +463,32 @@ fn main() -> Result<()> {
         .map(|j| *j as usize)
         .unwrap_or_else(|| std::cmp::max(1, num_cpus::get() / 2));
 
-    let binary_args: Vec<String> = matches
-        .get_many::<String>("ARGS")
-        .unwrap()
-        .map(|s| s.to_string())
-        .collect();
+    // Determine fuzzer type
+    let fuzzer_type_str = matches.get_one::<String>("fuzzer").unwrap();
+    let fuzzer_type = match fuzzer_type_str.as_str() {
+        "libfuzzer" => FuzzerType::LibFuzzer,
+        "afl" => FuzzerType::Afl,
+        _ => detect_fuzzer_type(input_dir),
+    };
+    eprintln!("Fuzzer type: {:?}", fuzzer_type);
+
+    // Get binary args from command line or AFL cmdline file
+    let binary_args: Vec<String> = if let Some(args) = matches.get_many::<String>("ARGS") {
+        args.map(|s| s.to_string()).collect()
+    } else if fuzzer_type == FuzzerType::Afl {
+        // Try to read from AFL cmdline file
+        match read_afl_cmdline(input_dir) {
+            Some(args) => {
+                eprintln!("Read command line from AFL cmdline file");
+                args
+            }
+            None => {
+                bail!("No ARGS provided and couldn't read cmdline file from AFL directory");
+            }
+        }
+    } else {
+        bail!("No target binary specified (use -- ./binary @@)");
+    };
 
     if binary_args.is_empty() {
         bail!("No target binary specified");
@@ -305,18 +513,21 @@ fn main() -> Result<()> {
     fs::create_dir_all(&reports_dir)?;
     fs::create_dir_all(&clusters_dir)?;
 
-    // Get all crash files
-    let crash_files: Vec<PathBuf> = fs::read_dir(input_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && !p.file_name().unwrap().to_str().unwrap().starts_with('.'))
-        .collect();
+    // Get all crash files based on fuzzer type
+    let crash_files: Vec<PathBuf> = match fuzzer_type {
+        FuzzerType::LibFuzzer => collect_libfuzzer_crashes(input_dir),
+        FuzzerType::Afl => collect_afl_crashes(input_dir),
+    };
 
     let total_crashes = crash_files.len();
     eprintln!("Found {} crash files", total_crashes);
 
     if total_crashes == 0 {
-        bail!("No crash files found in {}", input_dir.display());
+        let hint = match fuzzer_type {
+            FuzzerType::LibFuzzer => "Expected crash-* or leak-* files in the input directory",
+            FuzzerType::Afl => "Expected AFL++ directory structure with crashes/id* files",
+        };
+        bail!("No crash files found in {}. {}", input_dir.display(), hint);
     }
 
     // Step 1: Generate reports for all crashes in parallel
