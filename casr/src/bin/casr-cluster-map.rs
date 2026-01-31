@@ -435,6 +435,66 @@ fn main() -> Result<()> {
         reports_with_stacktraces.len()
     );
 
+    // Handle case where all crashes have the same stacktrace (1 unique)
+    if unique_stacktraces < 2 {
+        eprintln!("Only {} unique stacktrace(s), creating single cluster", unique_stacktraces);
+
+        // All crashes go to cluster 1
+        let mut mappings: Vec<CrashMapping> = Vec::new();
+        let mut is_first = true;
+        let mut representative_name: Option<String> = None;
+
+        for (crash_path, _, _) in &reports_with_stacktraces {
+            let crash_name = crash_path.file_name().unwrap().to_str().unwrap().to_string();
+
+            if is_first {
+                representative_name = Some(crash_name.clone());
+                mappings.push(CrashMapping {
+                    crash: crash_name,
+                    cluster_id: 1,
+                    is_representative: true,
+                    representative: None,
+                });
+                is_first = false;
+            } else {
+                mappings.push(CrashMapping {
+                    crash: crash_name,
+                    cluster_id: 1,
+                    is_representative: false,
+                    representative: representative_name.clone(),
+                });
+            }
+        }
+
+        // Sort mappings by crash name for consistent output
+        mappings.sort_by(|a, b| a.crash.cmp(&b.crash));
+
+        let result = ClusterMapResult {
+            total_crashes,
+            unique_stacktraces,
+            num_clusters: 1,
+            mappings: mappings.clone(),
+            clusters: [(
+                1,
+                mappings.iter().map(|m| m.crash.clone()).collect(),
+            )]
+            .into(),
+        };
+
+        let json = serde_json::to_string_pretty(&result)?;
+        fs::write(&mapping_file, &json)?;
+        eprintln!("Mapping written to {}", mapping_file.display());
+        println!("{}", json);
+
+        eprintln!("\n=== Summary ===");
+        eprintln!("Total crashes: {}", result.total_crashes);
+        eprintln!("Unique stacktraces: {}", result.unique_stacktraces);
+        eprintln!("Clusters: {}", result.num_clusters);
+        eprintln!("  Cluster 1: {} crashes", result.mappings.len());
+
+        return Ok(());
+    }
+
     // Step 4: Copy only representative reports to a temp dir for clustering
     let unique_reports_dir = output_dir.join("unique_reports");
     fs::create_dir_all(&unique_reports_dir)?;
