@@ -7,8 +7,10 @@
 //! Supports both libFuzzer and AFL++ crash directories.
 
 use casr::util;
+use libcasr::asan::AsanStacktrace;
 use libcasr::cluster::Cluster;
-use libcasr::stacktrace::{dedup_stacktraces, Filter, Stacktrace};
+use libcasr::report::CrashReport;
+use libcasr::stacktrace::{dedup_stacktraces, Filter, ParseStacktrace, Stacktrace};
 use libcasr::init_ignored_frames;
 
 use anyhow::{bail, Context, Result};
@@ -113,6 +115,55 @@ fn generate_report(
             stderr.trim()
         );
     }
+}
+
+/// Generate a CASR report from a crash log file (no binary re-execution)
+/// Used for libFuzzer with log-saving support.
+fn report_from_log(
+    crash_path: &Path,
+    logs_dir: &Path,
+    output_dir: &Path,
+) -> Result<PathBuf> {
+    let crash_name = crash_path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let log_path = logs_dir.join(format!("{}.log", crash_name));
+
+    if !log_path.exists() {
+        bail!("Log file not found: {}", log_path.display());
+    }
+
+    let log_content = fs::read_to_string(&log_path)
+        .with_context(|| format!("Failed to read log: {}", log_path.display()))?;
+
+    if log_content.is_empty() {
+        bail!("Log file is empty: {}", log_path.display());
+    }
+
+    // Use existing ASAN parser to extract stack trace lines
+    let stacktrace_lines = AsanStacktrace::extract_stacktrace(&log_content)
+        .with_context(|| format!("Failed to extract stacktrace from {}", log_path.display()))?;
+
+    if stacktrace_lines.is_empty() {
+        bail!("No stacktrace found in log: {}", log_path.display());
+    }
+
+    // Create a CrashReport with the raw stacktrace lines
+    // CrashReport.stacktrace is Vec<String>, not the parsed Stacktrace struct
+    let mut report = CrashReport::new();
+    report.stacktrace = stacktrace_lines;
+
+    // Mark as ASAN report so filtered_stacktrace() uses correct parser
+    report.asan_report = vec!["ASAN (from log)".to_string()];
+
+    // Save as .casrep JSON
+    let report_path = output_dir.join(format!("{}.casrep", crash_name));
+    let json = serde_json::to_string_pretty(&report)?;
+    fs::write(&report_path, json)?;
+
+    Ok(report_path)
 }
 
 /// Detect which CASR tool to use based on binary
@@ -435,6 +486,14 @@ fn main() -> Result<()> {
                 .help("File with regexes for functions/paths to ignore in stacktraces"),
         )
         .arg(
+            Arg::new("use-logs")
+                .long("use-logs")
+                .action(ArgAction::SetTrue)
+                .help("Use crash log files instead of re-running binaries. \
+                       Expects logs in {input}/logs/{crash_name}.log. \
+                       Only for libFuzzer with log-saving support."),
+        )
+        .arg(
             Arg::new("ARGS")
                 .action(ArgAction::Set)
                 .num_args(1..)
@@ -499,13 +558,33 @@ fn main() -> Result<()> {
         util::add_custom_ignored_frames(ignore_path)?;
     }
 
-    // Detect or use specified tool
-    let tool = if let Some(tool_name) = matches.get_one::<String>("tool") {
+    // Check for log-based mode (no binary re-runs)
+    let use_logs = matches.get_flag("use-logs");
+    let logs_dir = input_dir.join("logs");
+
+    if use_logs {
+        eprintln!("Mode: log-based (no binary re-runs)");
+        if !logs_dir.exists() {
+            bail!(
+                "Logs directory not found at {}. Was libFuzzer built with log-saving support?",
+                logs_dir.display()
+            );
+        }
+    }
+
+    // Detect or use specified tool (only needed for binary-based mode)
+    let tool = if use_logs {
+        // Dummy path - not used in log mode
+        PathBuf::new()
+    } else if let Some(tool_name) = matches.get_one::<String>("tool") {
         util::get_path(tool_name)?
     } else {
         detect_tool(Path::new(&binary_args[0]))?
     };
-    eprintln!("Using tool: {}", tool.display());
+
+    if !use_logs {
+        eprintln!("Using tool: {}", tool.display());
+    }
 
     // Create output directories
     let reports_dir = output_dir.join("reports");
@@ -543,7 +622,15 @@ fn main() -> Result<()> {
 
     pool.install(|| {
         crash_files.par_iter().for_each(|crash_path| {
-            match generate_report(&tool, crash_path, &reports_dir, &binary_args, timeout) {
+            let result = if use_logs {
+                // Log-based mode: parse stacktrace from log file (no binary re-run)
+                report_from_log(crash_path, &logs_dir, &reports_dir)
+            } else {
+                // Binary-based mode: re-run binary to generate crash report
+                generate_report(&tool, crash_path, &reports_dir, &binary_args, timeout)
+            };
+
+            match result {
                 Ok(report_path) => {
                     successful_reports
                         .write()
@@ -551,6 +638,14 @@ fn main() -> Result<()> {
                         .push((crash_path.clone(), report_path));
                 }
                 Err(e) => {
+                    // In log mode, warn about missing/invalid logs but don't fail
+                    if use_logs {
+                        eprintln!(
+                            "WARNING: Skipping {} - {}",
+                            crash_path.file_name().unwrap().to_str().unwrap(),
+                            e
+                        );
+                    }
                     failed
                         .write()
                         .unwrap()
