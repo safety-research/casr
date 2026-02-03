@@ -164,6 +164,55 @@ impl ParseStacktrace for AsanStacktrace {
     }
 }
 
+impl AsanStacktrace {
+    /// Extract ALL stacktraces from a log file containing multiple ASAN reports.
+    /// Returns a vector of stacktraces, one for each crash found in the log.
+    /// This is useful for parsing fuzzer logs that contain interleaved crash reports.
+    pub fn extract_all_stacktraces(stream: &str) -> Vec<Vec<String>> {
+        let lines: Vec<&str> = stream.split('\n').collect();
+        let mut stacktraces = Vec::new();
+        let mut i = 0;
+
+        while i < lines.len() {
+            // Look for stack trace start (line containing " #0 ")
+            if lines[i].contains(" #0 ") {
+                let first = i;
+                
+                // Find the end of this stack trace (empty line or end of file)
+                let mut last = first + 1;
+                while last < lines.len() && !lines[last].is_empty() {
+                    // Also stop if we hit another ERROR line (next crash)
+                    if lines[last].contains("==") && lines[last].contains("ERROR:") {
+                        break;
+                    }
+                    // Stop if we hit a non-stack-trace line (doesn't start with # or whitespace+#)
+                    let trimmed = lines[last].trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        break;
+                    }
+                    last += 1;
+                }
+
+                // Extract the stacktrace lines
+                let stacktrace: Vec<String> = lines[first..last]
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect();
+
+                if !stacktrace.is_empty() {
+                    stacktraces.push(stacktrace);
+                }
+
+                i = last;
+            } else {
+                i += 1;
+            }
+        }
+
+        stacktraces
+    }
+}
+
 /// Information about sanitizer crash state.
 pub struct AsanContext(pub Vec<String>);
 
@@ -234,6 +283,55 @@ impl Severity for AsanContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_all_stacktraces() {
+        // Simulated fuzzer log with multiple crashes
+        let log = r#"
+INFO: Running fuzzer...
+==123==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x123
+    #0 0x55aa11 in func1 /src/file1.c:10:5
+    #1 0x55aa22 in func2 /src/file2.c:20:5
+    #2 0x55aa33 in main /src/main.c:30:5
+
+#56815: cov: 100 ft: 200 corp: 50
+==456==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x456
+    #0 0x55bb11 in other_func /src/other.c:100:5
+    #1 0x55bb22 in caller /src/caller.c:200:5
+
+#56815: cov: 101 ft: 201 corp: 51
+==789==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x789
+    #0 0x55aa11 in func1 /src/file1.c:10:5
+    #1 0x55aa22 in func2 /src/file2.c:20:5
+    #2 0x55aa33 in main /src/main.c:30:5
+
+INFO: Done.
+"#;
+
+        let stacktraces = AsanStacktrace::extract_all_stacktraces(log);
+        
+        // Should find 3 stacktraces
+        assert_eq!(stacktraces.len(), 3);
+        
+        // First stacktrace should have 3 frames
+        assert_eq!(stacktraces[0].len(), 3);
+        assert!(stacktraces[0][0].contains("func1"));
+        
+        // Second stacktrace should have 2 frames (different bug)
+        assert_eq!(stacktraces[1].len(), 2);
+        assert!(stacktraces[1][0].contains("other_func"));
+        
+        // Third stacktrace should be same as first (duplicate)
+        assert_eq!(stacktraces[2].len(), 3);
+        assert!(stacktraces[2][0].contains("func1"));
+    }
+
+    #[test]
+    fn test_extract_all_stacktraces_empty() {
+        let log = "INFO: No crashes found\nDone.";
+        let stacktraces = AsanStacktrace::extract_all_stacktraces(log);
+        assert!(stacktraces.is_empty());
+    }
 
     #[test]
     fn test_asan_stacktrace() {
